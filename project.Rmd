@@ -1,0 +1,470 @@
+---
+title: "Descriptive Wins in Rugby"
+author: "Arjun Pandey, Lucas Cavalieri"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+```{r}
+suppressPackageStartupMessages(library(knitr)) #makes pdfs
+suppressPackageStartupMessages(library(latex2exp))
+suppressPackageStartupMessages(library(ggplot2)) #makes nice plots
+suppressPackageStartupMessages(library(tidyverse))
+#good library for data manipulation, includes dplyr and ggplot
+# you can read more about the tidyverse at: https://r4ds.had.co.nz/
+# you'll need this library for regularization if you use it
+suppressPackageStartupMessages(library(glmnet))
+# this library gives you the calibration plot
+suppressPackageStartupMessages(library(predtools))
+# gives you the logistic function (1/(1+e^{-x})) which might be helpful
+suppressPackageStartupMessages(library(psych))
+knitr::opts_chunk$set(echo = TRUE)
+library(rfUtilities)
+library(sp)
+library(rgdal)
+library(randomForest)
+library(rfPermute)
+```
+
+Load the data and add relevant columns
+```{r}
+data = read.csv('/Users/arjunpandey/Desktop/ready.csv')
+data$diff = data$home_score - data$away_score
+```
+
+Ensure that the performance indicators are not collinear
+```{r}
+cl <- multi.collinear(x=data[12:ncol(data) - 2],perm = FALSE, leave.out = FALSE, n = 99,
+p = 0.0000001, na.rm = FALSE)
+cl
+```
+
+Select test and train
+```{r}
+# data_reg = data
+train_sz = 91 #NEED TO CHANGE
+test_sz = nrow(data) - train_sz
+  
+data_permuted <- data[sample(nrow(data)),]
+train <- data_permuted[1:train_sz, ]
+test <- data_permuted[train_sz:nrow(data), ]
+```
+
+Run the regression RF using randomForest
+```{r}
+data.rf_reg <- randomForest(x = train[12:ncol(data) - 2], y = train$diff, xtest = test[12:ncol(data) - 2], ytest = test$diff, importance=TRUE, proximity=TRUE, keep.forest=TRUE)
+print(data.rf_reg)
+importance(data.rf_reg)
+```
+
+Run classification RF using randomForest
+```{r}
+data.rf_clas <- randomForest(x = train[12:ncol(data) - 2], y = as.factor(train$outcome), xtest = test[12:ncol(data) - 2], ytest = as.factor(test$outcome), importance=TRUE, proximity=TRUE, keep.forest = TRUE)
+print(data.rf_clas)
+importance(data.rf_clas)
+```
+
+Define appropriate explanatory and response variables for each model
+```{r}
+x_clas <- data[12:ncol(data) - 2]
+y_clas <- as.factor(data$outcome)
+
+x_reg <- data[12:ncol(data) - 2]
+y_reg <- data$diff
+```
+
+Run regression RF using rfPermute to get p-values
+```{r}
+data.rp_reg <- rfPermute(y_reg ~ ., x_reg, ntree = 500, num.rep = 100, importance = TRUE)
+summary(data.rp_reg)
+
+data.scaled_reg <- importance(data.rp_reg, scale = TRUE)
+data.scaled_reg
+```
+
+Plots for regression model above
+```{r}
+plotImportance(data.rp_reg, scale = TRUE, sig.only = FALSE)
+plotNull(data.rp_reg)
+```
+
+Run classification RF using rfPermute to get p-values
+```{r}
+data.rp_clas <- rfPermute(y_clas ~ ., x_clas, ntree = 500, num.rep = 100, importance = TRUE)
+summary(data.rp_clas)
+
+data.scaled <- importance(data.rp_clas, scale = TRUE)
+data.scaled
+```
+
+Plots for classification model above
+```{r}
+plotImportance(data.rp_clas, scale = TRUE, sig.only = FALSE)
+plotImpPreds(data.rf_clas, data, "outcome")
+```
+
+Get average values of each metric for all teams, which is used for simulations
+```{r}
+get_matchup_averages <- function(team, data) {
+  
+  data_alt = data
+  
+  # If team is away, multiply by -1 to treat each team as home
+  for (i in (1:nrow(data_alt))) {
+    if (data_alt[i,]$away_team == team) {
+      data_alt[i,12:ncol(data) - 2] = data_alt[i,12:ncol(data) - 2] * -1
+    }
+  }
+  
+  # Get all matches where team plays
+  matchup_data <- data_alt[((data_alt$home_team == team) | 
+                        (data_alt$away_team == team)), ]
+  
+  # Calculate averages for each metric
+  averages <- colMeans(matchup_data[,12:ncol(data) - 2], na.rm = TRUE)
+  return(averages)
+}
+
+avg_arg <- get_matchup_averages("Argentina", data)
+avg_aus <- get_matchup_averages("Australia", data)
+avg_nz <- get_matchup_averages("New Zealand", data)
+avg_sa <- get_matchup_averages("South Africa", data)
+
+```
+
+
+Using two Poisson distributions, find the probability that a team scores at least 3 tries more the other team
+```{r}
+
+# Finding Poisson distribution of tries for a given team
+find_lambda_tries <- function(team) {
+  tries = 0
+  matches = 0
+  
+  # If team is home
+  home_data <- data[(data$home_team == team), ]
+  tries <- tries + sum(home_data$home_tries)
+  matches <- matches + nrow(home_data)
+  
+  # If team is away
+  away_data <- data[(data$away_team == team), ]
+  tries <- tries + sum(away_data$away_tries)
+  matches <- matches + nrow(away_data)
+  
+  # Return mean
+  mean = tries / matches
+  return(mean)
+}
+
+tries_pois <- function(win, lose) {
+  win_lambda = find_lambda_tries(win)
+  lose_lambda = find_lambda_tries(lose)
+
+  diff = win_lambda - lose_lambda
+  
+  # Calculate P(X - Y < 3) = P(X - Y <= 2)
+  prob_less_than_3_tries <- ppois(2, lambda = diff)
+
+  # Calculate P(X - Y >= 3) = 1 - P(X - Y < 3)
+  res <- 1 - prob_less_than_3_tries
+  return(res)
+}
+
+```
+
+Using two Poisson distributions, find the probability that a team scores at least 15 points more the other team
+```{r}
+
+find_lambda_points <- function(team) {
+  points = 0
+  matches = 0
+  
+  # If team is home
+  home_data <- data[(data$home_team == team), ]
+  point <- points + sum(home_data$home_score)
+  matches <- matches + nrow(home_data)
+  
+  # If team is away
+  away_data <- data[(data$away_team == team), ]
+  points <- points + sum(away_data$away_score)
+  matches <- matches + nrow(away_data)
+  
+  # Return mean
+  mean = points / matches
+  return(mean)
+}
+
+# Calculate P(X - Y <= pts)
+points_pois <- function(win, lose, pts) {
+  win_lambda = find_lambda_points(win)
+  lose_lambda = find_lambda_points(lose)
+  
+  diff = win_lambda - lose_lambda
+  
+  res <- ppois(pts, lambda = diff)
+  return(res)
+}
+
+```
+
+Necessary code to run a single simulated tournament with regression model
+```{r}
+
+# Keep track of games and results
+setClass(
+  "Scores",
+  slots = list(
+    team1 = "character",
+    team2 = "character",
+    score = "numeric",
+    prob = "matrix"
+  )
+)
+
+# Predict the score differential for a given match
+simulation <- function(team1, team2, model, res_type) {
+  relative = team1 - team2
+  pred = predict(model, relative, type=res_type)
+  return(pred)
+}
+
+# Run a regression RF, which is done at each simulation
+run_rf_reg <- function() {
+  data_permuted_reg_run <- data[sample(nrow(data)),]
+  train_reg_run <- data_permuted_reg_run[1:train_sz, ]
+  test_reg_run <- data_permuted_reg_run[train_sz:nrow(data), ]
+
+  data.rf_reg_run <- randomForest(x = train_reg_run[12:ncol(data) - 2], y = train_reg_run$diff, xtest = test_reg_run[12:ncol(data) - 2], ytest = test_reg_run$diff, importance=TRUE, proximity=TRUE, keep.forest=TRUE)
+  return(data.rf_reg_run)
+}
+
+```
+
+Run a single simulated tournament with regression model
+```{r}
+
+round_reg  <- function() {
+  
+  # Initialize standings table
+  standings <- c("Argentina" = 0, "Australia" = 0, "New Zealand" = 0, "South Africa" = 0)
+  
+  # Run round-robin twice
+  for (i in 1:2) {
+    # Get a new random model
+    data.rf_round = run_rf_reg()
+    
+    # Simulate all matchup scores
+    sims <- list()
+    sims["arg_aus"] <- new("Scores", team1 ="Argentina", team2="Australia", score = simulation(avg_arg, avg_aus, data.rf_round, 'response'))
+    sims["arg_nz"] <- new("Scores", team1 ="Argentina", team2="New Zealand", score = simulation(avg_arg, avg_nz, data.rf_round, 'response'))
+    sims["arg_sa"] <- new("Scores", team1 ="Argentina", team2="South Africa", score = simulation(avg_arg, avg_sa, data.rf_round, 'response'))
+    sims["aus_nz"] <- new("Scores", team1 ="Australia", team2="New Zealand", score = simulation(avg_aus, avg_nz, data.rf_round, 'response'))
+    sims["aus_sa"] <- new("Scores", team1 ="Australia", team2="South Africa", score = simulation(avg_aus, avg_sa, data.rf_round, 'response'))
+    sims["nz_sa"] <- new("Scores", team1 ="New Zealand", team2="South Africa", score = simulation(avg_nz, avg_sa, data.rf_round, 'response'))
+    
+    # Adjust table standings accordingly
+    for (sim in sims) {
+      # If tie
+      if (sim@score == 0) {
+        standings[[sim@team1]] <- standings[[sim@team1]] + 2
+        standings[[sim@team2]] <- standings[[sim@team2]] + 2
+      }
+      # If team1 wins
+      else if (sim@score > 0) {
+        standings[[sim@team1]] <- standings[[sim@team1]] + 4
+        
+        # win bonus point
+        if (sim@score >= 15) {
+          p_tries = tries_pois(sim@team1, sim@team2)
+          p_pts = points_pois(sim@team1, sim@team2, 14)
+          p_pts <- 1 - p_pts
+          p = p_tries / p_pts
+          q = (1 - p_tries) / p_pts
+          bp <- sample(c(0, 1), size = 1, prob = c(q, p))
+          standings[[sim@team1]] <- standings[[sim@team1]] + bp
+        }
+        
+        # lose bonus point
+        if (sim@score <= 7) {
+          standings[[sim@team2]] <- standings[[sim@team2]] + 1
+        }
+      }
+      # If team 2 wins
+      else {
+        standings[[sim@team2]] <- standings[[sim@team2]] + 4
+        
+        # win bonus point
+        if (sim@score <= -15) {
+          p_tries = tries_pois(sim@team2, sim@team1)
+          p_pts = points_pois(sim@team2, sim@team1, 14)
+          p_pts <- 1 - p_pts
+          p = p_tries / p_pts
+          q = (1 - p_tries) / p_pts
+          bp <- sample(c(0, 1), size = 1, prob = c(q, p))
+          standings[[sim@team2]] <- standings[[sim@team2]] + bp
+        }
+        
+        # lose bonus point
+        if (sim@score >= -7) {
+          standings[[sim@team1]] <- standings[[sim@team1]] + 1
+        }
+      }
+    }
+  }
+  
+  rankings <- names(standings)[order(standings, decreasing = TRUE)]
+  return(as.list(rankings))
+}
+
+```
+
+Necessary code to run a single simulated tournament with classification model
+```{r}
+# Run a regression RF, which is done at each simulation
+run_rf_clas <- function() {
+  data_permuted_clas_run <- data[sample(nrow(data)),]
+  train_clas_run <- data_permuted_clas_run[1:train_sz, ]
+  test_clas_run <- data_permuted_clas_run[train_sz:nrow(data), ]
+
+  data.rf_clas_run <- randomForest(x = train_clas_run[12:ncol(data) - 2], y = as.factor(train_clas_run$outcome), xtest = test_clas_run[12:ncol(data) - 2], ytest = as.factor(test_clas_run$outcome), importance=TRUE, proximity=TRUE, keep.forest=TRUE)
+  return(data.rf_clas_run)
+}
+
+```
+
+Run a single simulated tournament with classification model
+```{r}
+
+round_clas  <- function() {
+  
+  # Initialize standings table
+  standings <- c("Argentina" = 0, "Australia" = 0, "New Zealand" = 0, "South Africa" = 0)
+  
+  # Run round-robin twice
+  for (i in 1:2) {
+    # Get a new random model
+    data.rf_round = run_rf_clas()
+    
+    # Simulate all matchup scores
+    sims <- list()
+    sims["arg_aus"] <- new("Scores", team1 ="Argentina", team2="Australia", prob = simulation(avg_arg, avg_aus, data.rf_round, 'prob'))
+    sims["arg_nz"] <- new("Scores", team1 ="Argentina", team2="New Zealand", prob = simulation(avg_arg, avg_nz, data.rf_round, 'prob'))
+    sims["arg_sa"] <- new("Scores", team1 ="Argentina", team2="South Africa", prob = simulation(avg_arg, avg_sa, data.rf_round, 'prob'))
+    sims["aus_nz"] <- new("Scores", team1 ="Australia", team2="New Zealand", prob = simulation(avg_aus, avg_nz, data.rf_round, 'prob'))
+    sims["aus_sa"] <- new("Scores", team1 ="Australia", team2="South Africa", prob = simulation(avg_aus, avg_sa, data.rf_round, 'prob'))
+    sims["nz_sa"] <- new("Scores", team1 ="New Zealand", team2="South Africa", prob = simulation(avg_nz, avg_sa, data.rf_round, 'prob'))
+    
+    # Adjust table standings accordingly
+    for (sim in sims) {
+      result <- sample(c(0, 1), size = 1, prob = c(sim@prob[1], sim@prob[2]))
+      
+      # If tie
+      if (sim@prob[1] == sim@prob[2]) {
+        standings[[sim@team1]] <- standings[[sim@team1]] + 2
+        standings[[sim@team2]] <- standings[[sim@team2]] + 2
+      }
+      # If team1 wins
+      else if (result == 1) {
+        standings[[sim@team1]] <- standings[[sim@team1]] + 4
+      }
+      # If team 2 wins
+      else {
+        standings[[sim@team2]] <- standings[[sim@team2]] + 4
+      }
+    }
+  }
+  
+  # Find the winner of the tournament
+  rankings <- names(standings)[order(standings, decreasing = TRUE)]
+  return(as.list(rankings))
+}
+
+```
+
+Run n simulations and see win distribution
+```{r}
+find_pdf <- function(rf_type, n_sims) {
+  winner <- list("Argentina" = c(0,0,0,0), "Australia" = c(0,0,0,0), "New Zealand" = c(0,0,0,0), "South Africa" = c(0,0,0,0))
+  
+  for (i in 1:n_sims) {
+    if (rf_type == "reg") {
+      ranks = round_reg()
+    } else if (rf_type == "clas") {
+      ranks = round_clas()
+    }
+    j = 1
+    for (team in ranks) {
+      winner[[team]][j] <- winner[[team]][j] + 1
+      j = j + 1
+    }
+  }
+  return(winner)
+}
+```
+
+Master to actually test
+```{r}
+n = 1000
+
+clas_sim = find_pdf("clas", n)
+reg_sim = find_pdf("reg", n)
+
+```
+Classification Plotting
+```{r}
+clas_probs <- list("Argentina" = c(0,0,0,0), "Australia" = c(0,0,0,0), "New Zealand" = c(0,0,0,0), "South Africa" = c(0,0,0,0))
+
+
+for (team in names(clas_sim)) {
+    clas_probs[[team]][1] = clas_sim[[team]][1] / n
+    clas_probs[[team]][2] = clas_sim[[team]][2] / n
+    clas_probs[[team]][3] = clas_sim[[team]][3] / n
+    clas_probs[[team]][4] = clas_sim[[team]][4] / n
+}
+
+colors = c("#69b3a2", "#1c03fc", "#fcba03", "#b5103c")
+countries = c("Argentina", "Australia", "South Africa", "New Zealand")
+
+
+R1 = c(clas_probs[["Argentina"]][1],clas_probs[["Australia"]][1],clas_probs[["South Africa"]][1],clas_probs[["New Zealand"]][1])
+R2 = c(clas_probs[["Argentina"]][2],clas_probs[["Australia"]][2],clas_probs[["South Africa"]][2],clas_probs[["New Zealand"]][2])
+R3 = c(clas_probs[["Argentina"]][3],clas_probs[["Australia"]][3],clas_probs[["South Africa"]][3],clas_probs[["New Zealand"]][3])
+R4 = c(clas_probs[["Argentina"]][4],clas_probs[["Australia"]][4],clas_probs[["South Africa"]][4],clas_probs[["New Zealand"]][4])
+
+clas_data = cbind("4" = R4, "3" = R3,"2" = R2,"1" = R1  )
+
+par(mar=c(8,4,4,4))
+barplot(clas_data, beside=T, col=c("#69b3a2", "#1c03fc", "#fcba03", "#b5103c"), horiz = T, xlim=c(0,1), legend = TRUE,  main = "Rank probabilities - RF Classification", xlab = "Probability", ylab="Rank",bty='L',vjust = -50)
+legend("bottom",  fill=c("#69b3a2", "#1c03fc", "#fcba03", "#b5103c"), legend=countries, horiz = T, cex = 0.8, inset = c(0,-0.6), xpd = NA)
+
+```
+
+Regression Plotting
+```{r}
+reg_probs <- list("Argentina" = c(0,0,0,0), "Australia" = c(0,0,0,0), "New Zealand" = c(0,0,0,0), "South Africa" = c(0,0,0,0))
+for (team in names(reg_sim)) {
+  reg_probs[[team]][1] = reg_sim[[team]][1] / n
+  reg_probs[[team]][2] = reg_sim[[team]][2] / n
+  reg_probs[[team]][3] = reg_sim[[team]][3] / n
+  reg_probs[[team]][4] = reg_sim[[team]][4] / n
+}
+
+R1_reg = c(reg_probs[["Argentina"]][1],reg_probs[["Australia"]][1],reg_probs[["South Africa"]][1],reg_probs[["New Zealand"]][1])
+R2_reg = c(reg_probs[["Argentina"]][2],reg_probs[["Australia"]][2],reg_probs[["South Africa"]][2],reg_probs[["New Zealand"]][2])
+R3_reg = c(reg_probs[["Argentina"]][3],reg_probs[["Australia"]][3],reg_probs[["South Africa"]][3],reg_probs[["New Zealand"]][3])
+R4_reg = c(reg_probs[["Argentina"]][4],reg_probs[["Australia"]][4],reg_probs[["South Africa"]][4],reg_probs[["New Zealand"]][4])
+
+# regression output probabilities
+reg_data = cbind("4" = R4_reg, "3" = R3_reg,"2" = R2_reg,"1" = R1_reg )
+
+par(mar=c(8,4,4,4))
+barplot(reg_data, beside=T, col=c("#69b3a2", "#1c03fc", "#fcba03", "#b5103c"), horiz = T, xlim=c(0,1), legend = TRUE,  main = "Rank probabilities - RF Regression", xlab = "Probability", ylab="Rank",bty='L',vjust = -50)
+legend("bottom",  fill=c("#69b3a2", "#1c03fc", "#fcba03", "#b5103c"), legend=countries, horiz = T, cex = 0.8, inset = c(0,-0.6), xpd = NA)
+```
+
+
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
